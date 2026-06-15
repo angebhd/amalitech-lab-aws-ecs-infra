@@ -1,0 +1,12 @@
+# Lab notes (kept local, not part of the infrastructure branch)
+NOTES*
+
+# Build/IDE artifacts that may exist in the shared working tree
+.gradle/
+build/
+.idea/
+.vscode/
+*.iml
+
+# Packaged pipeline config
+config-source.zip

@@ -1,0 +1,28 @@
+{
+  "template-file-path": "template.yaml",
+  "parameters": {
+    "ProjectName": "ecs-cicd",
+    "VpcCidr": "10.0.0.0/16",
+    "PublicSubnet1Cidr": "10.0.0.0/24",
+    "PublicSubnet2Cidr": "10.0.1.0/24",
+    "PrivateSubnet1Cidr": "10.0.10.0/24",
+    "PrivateSubnet2Cidr": "10.0.11.0/24",
+    "ContainerPort": "8080",
+    "TaskCpu": "256",
+    "TaskMemory": "512",
+    "DesiredCount": "1",
+    "MinTasks": "1",
+    "MaxTasks": "4",
+    "CpuTargetPercent": "50",
+    "HealthCheckPath": "/actuator/health",
+    "GitHubOrg": "angebhd",
+    "GitHubRepo": "amalitech-lab-aws-ecs",
+    "CreateOidcProvider": "false",
+    "CreateService": "false"
+  },
+  "tags": {
+    "project": "ecs-cicd",
+    "lab": "aws-ecs-cicd",
+    "managed-by": "cloudformation-gitsync"
+  }
+}
