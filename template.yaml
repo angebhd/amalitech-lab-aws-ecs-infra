@@ -5,7 +5,7 @@ Description: >
   private subnets across two Availability Zones. Tasks reach AWS services
   (ECR, CloudWatch Logs, STS, S3) exclusively through VPC interface and gateway
   endpoints — no NAT Gateway. New image pushes flow through CodePipeline
-  (GitHub + ECR sources) -> CodeDeploy (blue/green). GitHub Actions
+  (S3 config + ECR image sources) -> CodeDeploy (blue/green). GitHub Actions
   authenticates via OIDC. Deployed with CloudFormation GitSync.
 
 # ---------------------------------------------------------------------------
@@ -628,22 +628,9 @@ Resources:
         ScaleOutCooldown: 60
 
   # -------------------------------------------------------------------------
-  # CodeConnections - GitHub connection for CodePipeline source action.
-  # After stack creation, complete the handshake once in the AWS console:
-  # CodePipeline > Settings > Connections > Activate pending connection.
-  # -------------------------------------------------------------------------
-  GitHubConnection:
-    Type: AWS::CodeConnections::Connection
-    Properties:
-      ConnectionName: !Sub "${ProjectName}-github"
-      ProviderType: GitHub
-      Tags:
-        - Key: Name
-          Value: !Sub "${ProjectName}-github"
-
-  # -------------------------------------------------------------------------
-  # GitHub Actions OIDC - federated role for pushing images to ECR. No
-  # long-lived secrets; trust is scoped to the application repository.
+  # GitHub Actions OIDC - federated role for pushing images to ECR and
+  # uploading the rendered deploy bundle to S3. No long-lived secrets; trust is
+  # scoped to the application repository.
   # -------------------------------------------------------------------------
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
@@ -691,17 +678,26 @@ Resources:
                   - ecr:InitiateLayerUpload
                   - ecr:PutImage
                   - ecr:UploadLayerPart
-                  - ecr:BatchGetImage
-                  - ecr:GetDownloadUrlForLayer
                   - ecr:DescribeImages
                 Resource: !GetAtt EcrRepository.Arn
+        - PolicyName: deploy-bundle-upload
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Upload the rendered config-source.zip (taskdef + appspec, with the
+              # role ARNs injected) that the pipeline's S3 source action consumes.
+              # GetObject also covers the HeadObject hash check that gates uploads.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${ArtifactBucket.Arn}/config-source.zip"
         - PolicyName: trigger-pipeline
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # On a re-run the same SHA tag already exists, so no new image is
-              # pushed and the ECR source action never fires. The workflow detects
-              # this and starts the pipeline explicitly.
+              # On a re-run the :latest digest is unchanged, so ECR emits no push
+              # event. The workflow detects this and starts the pipeline explicitly.
               - Effect: Allow
                 Action: codepipeline:StartPipelineExecution
                 Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectName}-pipeline"
@@ -834,9 +830,6 @@ Resources:
                   - !GetAtt TaskExecutionRole.Arn
                   - !GetAtt TaskRole.Arn
               - Effect: Allow
-                Action: codestar-connections:UseConnection
-                Resource: !Ref GitHubConnection
-              - Effect: Allow
                 Action:
                   - ecr:DescribeImages
                   - ecr:BatchGetImage
@@ -857,23 +850,26 @@ Resources:
         Location: !Ref ArtifactBucket
       Stages:
         # Two source actions run in parallel:
-        # - ConfigSource: pulls taskdef.json + appspec.yaml from the GitHub repo.
-        # - ImageSource: detects a new push to the `latest` ECR tag and produces
-        #   imageDetail.json with the digest. CodeDeployToECS substitutes
-        #   <IMAGE1_NAME> in taskdef.json with the actual image URI from that file.
+        # - ConfigSource: the rendered config-source.zip (taskdef + appspec, role
+        #   ARNs already injected by CI) from S3. PollForSourceChanges is false so
+        #   this source never triggers the pipeline on its own - its contents are
+        #   just fetched whenever the pipeline runs.
+        # - ImageSource: produces imageDetail.json with the digest of the :latest
+        #   image. CodeDeployToECS substitutes <IMAGE1_NAME> in taskdef.json with
+        #   the actual image URI from that file. EcrPushRule (below) triggers the
+        #   pipeline when :latest is pushed.
         - Name: Source
           Actions:
             - Name: ConfigSource
               ActionTypeId:
                 Category: Source
                 Owner: AWS
-                Provider: CodeStarSourceConnection
+                Provider: S3
                 Version: "1"
               Configuration:
-                ConnectionArn: !Ref GitHubConnection
-                FullRepositoryId: !Sub "${GitHubOrg}/${GitHubRepo}"
-                BranchName: main
-                OutputArtifactFormat: CODE_ZIP
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: config-source.zip
+                PollForSourceChanges: "false"
               OutputArtifacts:
                 - Name: ConfigArtifact
               RunOrder: 1
@@ -901,15 +897,69 @@ Resources:
                 ApplicationName: !Ref CodeDeployApplication
                 DeploymentGroupName: !Ref CodeDeployDeploymentGroup
                 TaskDefinitionTemplateArtifact: ConfigArtifact
-                TaskDefinitionTemplatePath: deploy/taskdef.json
+                TaskDefinitionTemplatePath: taskdef.json
                 AppSpecTemplateArtifact: ConfigArtifact
-                AppSpecTemplatePath: deploy/appspec.yaml
+                AppSpecTemplatePath: appspec.yaml
                 Image1ArtifactName: ImageArtifact
                 Image1ContainerName: !Sub "${ProjectName}-app"
               InputArtifacts:
                 - Name: ConfigArtifact
                 - Name: ImageArtifact
               RunOrder: 1
+
+  # -------------------------------------------------------------------------
+  # EventBridge - start the pipeline when the :latest image tag is pushed to
+  # ECR. (A CloudFormation-created pipeline does not get an automatic trigger
+  # for its ECR source action, so the rule is explicit.) The image-tag filter
+  # keeps the rule from also firing on the immutable :ange_buhendwa_<sha> push.
+  # -------------------------------------------------------------------------
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateService
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-eventbridge-role"
+
+  EcrPushRule:
+    Type: AWS::Events::Rule
+    Condition: ShouldCreateService
+    Properties:
+      Name: !Sub "${ProjectName}-ecr-push"
+      Description: Trigger the pipeline when the latest image tag is pushed to ECR.
+      EventPattern:
+        source:
+          - aws.ecr
+        detail-type:
+          - ECR Image Action
+        detail:
+          action-type:
+            - PUSH
+          result:
+            - SUCCESS
+          repository-name:
+            - !Ref EcrRepository
+          image-tag:
+            - latest
+      Targets:
+        - Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}"
+          Id: pipeline
+          RoleArn: !GetAtt EventBridgeRole.Arn
 
 # ---------------------------------------------------------------------------
 # Outputs
@@ -927,14 +977,16 @@ Outputs:
     Description: Role ARN for GitHub Actions to assume via OIDC.
     Value: !GetAtt GitHubActionsRole.Arn
 
-  GitHubConnectionArn:
-    Description: >
-      CodeConnections connection ARN. Complete the GitHub handshake in the
-      AWS console before the pipeline can run.
-    Value: !Ref GitHubConnection
+  TaskExecutionRoleArn:
+    Description: Set this as the ECS_EXECUTION_ROLE_ARN GitHub repository variable.
+    Value: !GetAtt TaskExecutionRole.Arn
+
+  TaskRoleArn:
+    Description: Set this as the ECS_TASK_ROLE_ARN GitHub repository variable.
+    Value: !GetAtt TaskRole.Arn
 
   ArtifactBucketName:
-    Description: Bucket holding pipeline artifacts.
+    Description: Bucket holding pipeline artifacts and the rendered config-source.zip.
     Value: !Ref ArtifactBucket
 
   ClusterName:

@@ -160,32 +160,40 @@ flowchart LR
 flowchart LR
     dev(["Developer push to main"]) --> gha["GitHub Actions\nOIDC, no static keys"]
 
+    gha -->|"render taskdef\n(inject role ARNs)\nupload if changed"| s3[("S3\nconfig-source.zip")]
     gha -->|"push :ange_buhendwa_sha\n+ :latest"| ecr[("Amazon ECR\nmutable latest tag")]
 
-    ecr -->|ECR source action| cp["CodePipeline"]
-    gh[("GitHub repo\ntaskdef.json + appspec.yaml")] -->|CodeConnections source| cp
+    ecr -->|":latest push"| eb["EventBridge rule\nimage-tag=latest"]
+    eb -->|start| cp["CodePipeline"]
+    s3 -->|S3 source| cp
+    ecr -->|ECR source\nimageDetail.json| cp
 
     cp -->|CodeDeployToECS\nsubstitutes IMAGE1_NAME| cd["CodeDeploy\nblue/green"]
     cd -->|register taskdef + shift traffic| ecs["ECS Fargate service"]
 ```
 
-1. Push to `main` → GitHub Actions assumes an IAM role via **OIDC** and builds
-   the image.
-2. Image is tagged **`ange_buhendwa_<sha>`** (immutable, for traceability) and
-   **`latest`** (mutable, watched by CodePipeline). Both tags are pushed to ECR.
-3. The `latest` push triggers **CodePipeline** via the **ECR source action**
-   (which also produces `imageDetail.json` with the exact digest).
-4. CodePipeline also pulls `deploy/taskdef.json` and `deploy/appspec.yaml`
-   directly from GitHub via a **CodeConnections** source action — no S3 upload.
-5. The **CodeDeployToECS** action substitutes `<IMAGE1_NAME>` in `taskdef.json`
-   with the actual image URI from `imageDetail.json`, registers the new task
+1. Push to `main` → GitHub Actions assumes an IAM role via **OIDC**.
+2. The workflow **renders** `deploy/taskdef.json`, injecting the execution/task
+   role ARNs and region from repository variables, bundles it with
+   `appspec.yaml`, and uploads `config-source.zip` to S3 — **only when the
+   rendered content changed** (a content hash gates the upload).
+3. Image is tagged **`ange_buhendwa_<sha>`** (immutable) and **`latest`**
+   (mutable) and both are pushed to ECR.
+4. The `latest` push fires an **EventBridge rule** (filtered to
+   `image-tag=latest`) that starts **CodePipeline**.
+5. CodePipeline has two sources: the **S3** config bundle and the **ECR** image
+   (which produces `imageDetail.json` with the digest). The **CodeDeployToECS**
+   action substitutes `<IMAGE1_NAME>` in `taskdef.json`, registers the new task
    definition, and runs **blue/green** — see section 2.
 
-### Static deploy files
+### Why role ARNs are injected in CI
 
-`taskdef.json` contains no dynamic values except the `<IMAGE1_NAME>` placeholder
-(filled by CodeDeploy). Execution and task role ARNs are hardcoded using
-deterministic `RoleName` values set in the CloudFormation template.
+ECS only resolves SSM/Secrets values for container **environment variables**;
+`executionRoleArn`/`taskRoleArn` are task-level **structural fields** that must
+be literal ARNs at `RegisterTaskDefinition` time, and `CodeDeployToECS` only
+substitutes `<IMAGE1_NAME>`. So the taskdef must be rendered before deploy. The
+workflow does this from GitHub repository variables (kept out of the repo) and
+ships the result through S3. Full rationale: app repo `NOTES-question.md`.
 
 ## 5. Application auto scaling
 
@@ -201,8 +209,8 @@ deterministic `RoleName` values set in the CloudFormation template.
 | Compute | ECS cluster, Fargate task definition, service (CODE_DEPLOY controller) |
 | Edge | ALB, prod listener `:80`, test listener `:8080`, blue + green target groups |
 | Images | ECR repo (mutable tags, scan-on-push, lifecycle: keep last 10) |
-| CI | GitHub Actions + IAM OIDC provider/role (ECR push only) |
-| CD | CodeConnections, CodePipeline (GitHub + ECR sources), CodeDeploy app + deployment group |
+| CI | GitHub Actions + IAM OIDC provider/role (ECR push + S3 config upload) |
+| CD | EventBridge rule, CodePipeline (S3 config + ECR image sources), CodeDeploy app + deployment group |
 | Observability | CloudWatch Logs (`/ecs/ecs-cicd`), Container Insights |
 | Scaling | Application Auto Scaling target + CPU target-tracking policy |
 
