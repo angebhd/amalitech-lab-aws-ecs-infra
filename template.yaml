@@ -901,7 +901,9 @@ Resources:
                 AppSpecTemplateArtifact: ConfigArtifact
                 AppSpecTemplatePath: appspec.yaml
                 Image1ArtifactName: ImageArtifact
-                Image1ContainerName: !Sub "${ProjectName}-app"
+                # NOT the ECS container name - this is the placeholder TOKEN that
+                # CodeDeploy replaces in taskdef.json. "IMAGE1_NAME" -> <IMAGE1_NAME>.
+                Image1ContainerName: IMAGE1_NAME
               InputArtifacts:
                 - Name: ConfigArtifact
                 - Name: ImageArtifact
