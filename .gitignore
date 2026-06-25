@@ -10,3 +10,11 @@ build/
 
 # Packaged pipeline config
 config-source.zip
+
+# Diagram-as-code generator (local tooling; the rendered architecture.png is the deliverable)
+architecture_diagram.py
+__pycache__/
+*.pyc
+
+
+*temp
